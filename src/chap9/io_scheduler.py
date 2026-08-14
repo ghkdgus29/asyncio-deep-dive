@@ -19,7 +19,7 @@ class Scheduler:
     def call_later(self, delay, func):
         self.sequence += 1
         deadline = time.time() + delay  # Expiration time
-        # Priority queue
+        # sequence breaks ties when deadlines match (heapq needs func to be unorderable-safe)
         heapq.heappush(self.sleeping, (deadline, self.sequence, func))
 
     def read_wait(self, fileno, func):
@@ -33,7 +33,8 @@ class Scheduler:
     def run(self):
         while self.ready or self.sleeping or self._read_waiting or self._write_waiting:
             if not self.ready:
-                # Find the nearest deadline
+                # Only block in select() when there's nothing else to run;
+                # timeout caps the wait so the nearest sleeping task still wakes on time
                 if self.sleeping:
                     deadline, _, func = self.sleeping[0]
                     timeout = deadline - time.time()
@@ -68,24 +69,24 @@ class Scheduler:
 
     async def sleep(self, delay):
         self.call_later(delay, self.current)
-        self.current = None
+        self.current = None  # mark as "not runnable"; Task.__call__ won't re-queue it
         await switch()  # Switch to a new task
 
     async def recv(self, sock, maxbytes):
         self.read_wait(sock, self.current)
-        self.current = None
+        self.current = None  # blocked on I/O, not requeued until socket is readable
         await switch()
         return sock.recv(maxbytes)
 
     async def send(self, sock, data):
         self.write_wait(sock, self.current)
-        self.current = None
+        self.current = None  # blocked on I/O, not requeued until socket is writeable
         await switch()
         return sock.send(data)
 
     async def accept(self, sock):
         self.read_wait(sock, self.current)
-        self.current = None
+        self.current = None  # blocked on I/O, not requeued until a connection arrives
         await switch()
         return sock.accept()
 
@@ -99,8 +100,10 @@ class Task:
         try:
             # Driving the coroutine as before
             sched.current = self
-            self.coro.send(None)
-            if sched.current:
+            self.coro.send(None)  # run until the next `await switch()`
+            if sched.current: 
+                # still set to self => coroutine yielded without blocking on I/O/sleep,
+                # so just reschedule it to run again next turn
                 sched.ready.append(self)
         except StopIteration:
             pass
@@ -108,7 +111,7 @@ class Task:
 
 class Awaitable:
     def __await__(self):
-        yield
+        yield  # bare yield: hands control back to Task.__call__ without a value
 
 
 def switch():
